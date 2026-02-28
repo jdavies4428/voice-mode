@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jefe — Voice Mode</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #080808;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+  header {
+    padding: 18px 28px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  header .title { font-size: 13px; font-weight: 600; color: #888; letter-spacing: 0.08em; text-transform: uppercase; }
+  .status-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #333;
+    transition: background 0.4s;
+  }
+  .status-dot.listening { background: #2d6a2d; }
+  .status-dot.working   { background: #ff3300; box-shadow: 0 0 6px #ff3300; }
+  .claw-section {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px 24px;
+    gap: 20px;
+    position: relative;
+  }
+  .claw-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .claw {
+    font-size: 120px;
+    line-height: 1;
+    filter: saturate(0.3) brightness(0.6);
+    transition: filter 0.5s ease, transform 0.3s ease;
+    cursor: pointer;
+  }
+  .claw.listening {
+    filter: saturate(0.5) brightness(0.8);
+  }
+  .claw.working {
+    filter: saturate(1.5) brightness(1.3) drop-shadow(0 0 30px rgba(255,40,0,0.8));
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .claw.speaking {
+    filter: saturate(1.2) brightness(1.1) drop-shadow(0 0 20px rgba(204,136,0,0.6));
+    animation: speak-pulse 0.8s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%   { transform: scale(1.00); filter: saturate(1.5) brightness(1.2) drop-shadow(0 0 20px rgba(255,40,0,0.7)); }
+    50%  { transform: scale(1.08); filter: saturate(2.0) brightness(1.5) drop-shadow(0 0 50px rgba(255,40,0,1.0)); }
+    100% { transform: scale(1.00); filter: saturate(1.5) brightness(1.2) drop-shadow(0 0 20px rgba(255,40,0,0.7)); }
+  }
+  @keyframes speak-pulse {
+    0%   { transform: scale(1.00); }
+    50%  { transform: scale(1.03); }
+    100% { transform: scale(1.00); }
+  }
+  .status-label {
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #444;
+    transition: color 0.4s;
+    min-height: 18px;
+  }
+  .status-label.listening { color: #2d6a2d; }
+  .status-label.working   { color: #ff3300; }
+  .status-label.speaking  { color: #cc8800; }
+  .audio-gate {
+    position: absolute;
+    inset: 0;
+    background: rgba(8,8,8,0.92);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    z-index: 10;
+    cursor: pointer;
+    transition: opacity 0.4s ease;
+  }
+  .audio-gate.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .audio-gate .gate-icon { font-size: 80px; filter: saturate(0.4) brightness(0.8); }
+  .audio-gate .gate-text {
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #666;
+  }
+  .divider {
+    height: 1px;
+    background: #141414;
+    margin: 0 28px;
+  }
+  .conversation {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .conversation::-webkit-scrollbar { width: 4px; }
+  .conversation::-webkit-scrollbar-track { background: transparent; }
+  .conversation::-webkit-scrollbar-thumb { background: #222; border-radius: 2px; }
+  .message {
+    max-width: 85%;
+    padding: 12px 16px;
+    border-radius: 14px;
+    font-size: 14px;
+    line-height: 1.6;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .message.assistant {
+    background: #141414;
+    border: 1px solid #1e1e1e;
+    color: #d0d0d0;
+    align-self: flex-start;
+    border-bottom-left-radius: 4px;
+  }
+  .message.assistant .speaker {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #cc2200;
+    margin-bottom: 5px;
+  }
+  .empty-state {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #2a2a2a;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="status-dot" id="statusDot"></div>
+  <div class="title">Jefe — Voice Mode</div>
+</header>
+<div class="claw-section">
+  <div class="claw-wrap">
+    <div class="claw" id="claw">🦞</div>
+  </div>
+  <div class="status-label" id="statusLabel">Connecting...</div>
+  <div class="audio-gate" id="audioGate">
+    <div class="gate-icon">🦞</div>
+    <div class="gate-text">Click to enable voice</div>
+  </div>
+</div>
+<div class="divider"></div>
+<div class="conversation" id="conversation">
+  <div class="empty-state" id="emptyState">Waiting for messages</div>
+</div>
+<script>
+const claw = document.getElementById('claw');
+const statusLabel = document.getElementById('statusLabel');
+const statusDot = document.getElementById('statusDot');
+const conversation = document.getElementById('conversation');
+const emptyState = document.getElementById('emptyState');
+const audioGate = document.getElementById('audioGate');
+let seenMessages = new Set();
+
+// --- Clean OpenClaw directives from text ---
+function cleanText(text) {
+  return text.replace(/\[\[[^\]]*\]\]\s*/g, '').trim();
+}
+
+// --- Audio context for Web Audio API playback ---
+let audioCtx = null;
+let audioInitialized = false;
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new AudioContext();
+  return audioCtx;
+}
+
+async function initAudio() {
+  if (audioInitialized) return;
+  const ctx = getAudioCtx();
+  if (ctx.state === 'suspended') {
+    await ctx.resume();
+  }
+  if (ctx.state === 'running') {
+    audioInitialized = true;
+    audioGate.classList.add('hidden');
+    console.log('[voice] Audio enabled');
+  }
+}
+
+// Gate click enables audio
+audioGate.addEventListener('click', initAudio);
+// Any click on the page also enables audio
+document.body.addEventListener('click', initAudio);
+// Click lobster to force-reset from stuck states
+claw.addEventListener('click', () => {
+  initAudio();
+  if (currentState === 'working') {
+    setState('idle');
+  }
+});
+
+// --- State machine ---
+let currentState = 'connecting';
+function setState(state) {
+  currentState = state;
+  // Map state names to CSS classes
+  const cssClass = state === 'idle' ? 'listening' : state;
+  claw.className = `claw ${cssClass}`;
+  statusDot.className = `status-dot ${cssClass}`;
+  statusLabel.className = `status-label ${cssClass}`;
+  const labels = {
+    idle: 'Listening...',
+    working: 'Thinking...',
+    speaking: 'Speaking...',
+    connecting: 'Connecting...'
+  };
+  statusLabel.textContent = labels[state] || state;
+  
+  // Show gate if audio not yet enabled
+  if (!audioInitialized && (state === 'speaking' || state === 'idle')) {
+    audioGate.classList.remove('hidden');
+  }
+}
+
+// --- Sentence splitting (mirrors server-side) ---
+function splitSentences(text) {
+  // Strip markdown
+  let clean = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]+`/g, '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
+    .replace(/_{1,2}([^_]+)_{1,2}/g, '$1')
+    .replace(/\[([^\]]+)\]\([\^\)]+\)/g, '$1')
+    .replace(/^\s*[-*•]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  // Split on sentence boundaries
+  let parts = clean.split(/(?<=[.!?])\s+/);
+  return parts.map(s => s.trim()).filter(s => s.length > 0);
+}
+
+// --- TTS: fetch audio from server and play via Web Audio API ---
+let speakAbort = null;
+
+async function fetchTTSAudio(text) {
+  const resp = await fetch('/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  if (!resp.ok) throw new Error(`TTS failed: ${resp.status}`);
+  return await resp.arrayBuffer();
+}
+
+function playAudioBuffer(buffer) {
+  return new Promise(async (resolve) => {
+    try {
+      const ctx = getAudioCtx();
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      // If still suspended (no user gesture yet), skip playback
+      if (ctx.state !== 'running') {
+        console.warn('[voice] AudioContext suspended, skipping playback');
+        audioGate.classList.remove('hidden');
+        resolve();
+        return;
+      }
+      const audioBuffer = await ctx.decodeAudioData(buffer);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.onended = resolve;
+      source.onerror = resolve;
+      source.start(0);
+      // Safety timeout so we never hang forever
+      setTimeout(resolve, (audioBuffer.duration + 2) * 1000);
+    } catch (e) {
+      console.error('[voice] Audio playback error:', e);
+      resolve();
+    }
+  });
+}
+
+async function speakWithKokoro(text) {
+  if (!text || text === 'NO_REPLY' || text === 'HEARTBEAT_OK') {
+    setState('idle');
+    return;
+  }
+
+  // Initialize audio on first speak attempt
+  await initAudio();
+
+  // Create abort controller for this speech session
+  const abortId = Symbol();
+  speakAbort = abortId;
+
+  const sentences = splitSentences(text);
+  if (sentences.length === 0) {
+    setState('idle');
+    return;
+  }
+
+  setState('speaking');
+
+  // Prefetch pipeline: fetch sentence N+1 while playing sentence N
+  let nextFetch = null;
+
+  for (let i = 0; i < sentences.length; i++) {
+    // Check if we've been interrupted
+    if (speakAbort !== abortId) return;
+
+    const sentence = sentences[i];
+    // Truncate very long sentences
+    const truncated = sentence.length > 500 ? sentence.slice(0, 500) + '...' : sentence;
+
+    let audioData;
+    try {
+      if (nextFetch) {
+        // Use prefetched audio
+        audioData = await nextFetch;
+      } else {
+        // First sentence - fetch now
+        audioData = await fetchTTSAudio(truncated);
+      }
+    } catch (e) {
+      console.error('[voice] TTS fetch error:', e);
+      // Fall back to Web Speech API for this sentence
+      await fallbackSpeak(truncated);
+      nextFetch = null;
+      continue;
+    }
+
+    // Start prefetching next sentence while we play this one
+    if (i + 1 < sentences.length) {
+      const nextSentence = sentences[i + 1];
+      const nextTruncated = nextSentence.length > 500 ? nextSentence.slice(0, 500) + '...' : nextSentence;
+      nextFetch = fetchTTSAudio(nextTruncated);
+    } else {
+      nextFetch = null;
+    }
+
+    // Play this sentence
+    if (speakAbort !== abortId) return;
+    try {
+      await playAudioBuffer(audioData);
+    } catch (e) {
+      console.error('[voice] Audio playback error:', e);
+    }
+  }
+
+  if (speakAbort === abortId) {
+    setState('idle');
+  }
+}
+
+// Fallback to Web Speech API if Kokoro is unavailable
+function fallbackSpeak(text) {
+  return new Promise(resolve => {
+    if (!('speechSynthesis' in window)) { resolve(); return; }
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 1.1;
+    utter.onend = resolve;
+    utter.onerror = resolve;
+    speechSynthesis.speak(utter);
+  });
+}
+
+// --- Message display ---
+function addMessage(text) {
+  if (seenMessages.has(text)) return;
+  seenMessages.add(text);
+  if (emptyState) emptyState.remove();
+  const div = document.createElement('div');
+  div.className = 'message assistant';
+  div.innerHTML = `<div class="speaker">Jefe</div><div>${text.replace(/\n/g,'<br>')}</div>`;
+  conversation.insertBefore(div, conversation.firstChild);
+}
+
+// --- SSE connection ---
+function connect() {
+  setState('connecting');
+  const es = new EventSource('/events');
+
+  es.onopen = () => {
+    console.log('[voice] SSE connected');
+    setState('idle');
+  };
+
+  es.onmessage = async (e) => {
+    console.log('[voice] SSE message:', e.data);
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'working') {
+      // Only interrupt if currently speaking
+      if (currentState === 'speaking') {
+        speakAbort = null;
+        if (audioCtx) {
+          audioCtx.close();
+          audioCtx = null;
+          audioInitialized = false;
+        }
+      }
+      setState('working');
+    } else if (msg.type === 'done' && msg.text) {
+      const text = cleanText(msg.text);
+      addMessage(text);
+      try {
+        await speakWithKokoro(text);
+      } catch (e) {
+        console.error('[voice] speakWithKokoro error:', e);
+        setState('idle');
+      }
+    } else if (msg.type === 'idle') {
+      if (currentState !== 'speaking') {
+        setState('idle');
+      }
+    }
+  };
+
+  es.onerror = (e) => {
+    console.error('[voice] SSE error:', e);
+    setState('connecting');
+    es.close();
+    setTimeout(connect, 3000);
+  };
+}
+
+connect();
+
+// Try to auto-unlock audio on page load (works in some browsers)
+(async () => {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === 'suspended') await ctx.resume();
+    if (ctx.state === 'running') {
+      audioInitialized = true;
+      audioGate.classList.add('hidden');
+    }
+  } catch(e) {}
+})();
+</script>
+</body>
+</html>
