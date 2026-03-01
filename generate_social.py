@@ -3,7 +3,7 @@
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 
-W, H = 1280, 640
+W, H = 1200, 630
 img = Image.new("RGB", (W, H), "#080808")
 draw = ImageDraw.Draw(img)
 
