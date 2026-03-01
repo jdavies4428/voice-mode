@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Voice Mode server — watches session file directly."""
+"""Voice Mode server — watches OpenClaw session files, serves TTS."""
 
 import asyncio
 import io
@@ -10,7 +10,6 @@ import struct
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
 from pathlib import Path
 
 import uvicorn
@@ -26,6 +25,22 @@ MODELS_DIR = SCRIPT_DIR / "models"
 SESSIONS_DIR = Path("~/.openclaw/agents/main/sessions").expanduser()
 
 
+OPENCLAW_CONFIG = Path("~/.openclaw/openclaw.json").expanduser()
+
+
+def get_config_model() -> tuple[str | None, str | None]:
+    """Read the default model from OpenClaw's config file."""
+    try:
+        config = json.loads(OPENCLAW_CONFIG.read_text())
+        primary = config.get("agents", {}).get("defaults", {}).get("model", {}).get("primary")
+        if primary and "/" in primary:
+            provider = primary.split("/")[0]
+            return primary, provider
+        return primary, None
+    except Exception:
+        return None, None
+
+
 def get_latest_session() -> Path | None:
     """Return the most recently modified .jsonl session file."""
     try:
@@ -36,6 +51,73 @@ def get_latest_session() -> Path | None:
     except Exception:
         return None
 
+
+def scan_session_metadata(session_file: Path) -> dict:
+    """Scan a session file for the current model and cumulative cost."""
+    model_id = None
+    provider = None
+    total_cost = 0.0
+    total_input = 0
+    total_output = 0
+    try:
+        with open(session_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                etype = entry.get("type")
+                # Model change events
+                if etype == "model_change":
+                    model_id = entry.get("modelId", model_id)
+                    provider = entry.get("provider", provider)
+                # Model snapshots
+                elif etype == "custom" and entry.get("customType") == "model-snapshot":
+                    data = entry.get("data", {})
+                    model_id = data.get("modelId", model_id)
+                    provider = data.get("provider", provider)
+                # Accumulate usage from assistant messages
+                elif etype == "message":
+                    msg = entry.get("message", {})
+                    usage = msg.get("usage")
+                    if usage:
+                        total_cost += usage.get("cost", {}).get("total", 0)
+                        total_input += usage.get("input", 0)
+                        total_output += usage.get("output", 0)
+    except Exception:
+        pass
+    # Config model is authoritative (user may have changed it via `openclaw models set`)
+    config_model, config_provider = get_config_model()
+    if config_model:
+        model_id = config_model
+        provider = config_provider
+
+    return {
+        "modelId": model_id,
+        "provider": provider,
+        "totalCost": round(total_cost, 6),
+        "totalInput": total_input,
+        "totalOutput": total_output,
+    }
+
+
+def format_model_name(model_id: str | None) -> str:
+    """Format model ID for display: 'anthropic/claude-opus-4-6' -> 'claude opus 4.6'"""
+    if not model_id:
+        return "unknown"
+    # Strip provider prefix
+    name = model_id.split("/")[-1]
+    # Clean up common patterns
+    name = name.replace("-", " ").replace("_", " ")
+    # Fix version dots: "4 6" -> "4.6"
+    name = re.sub(r'(\d+)\s+(\d+)$', r'\1.\2', name)
+    name = re.sub(r'(\d+)\s+(\d+)\s+', r'\1.\2 ', name)
+    return name
+
+
 # --- Kokoro TTS singleton ---
 _kokoro = None
 _kokoro_lock = asyncio.Lock()
@@ -45,7 +127,6 @@ KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.1"))
 
 
 def _load_kokoro():
-    """Load Kokoro model synchronously (called in thread)."""
     from kokoro_onnx import Kokoro
     model_path = str(MODELS_DIR / "kokoro-v1.0.onnx")
     voices_path = str(MODELS_DIR / "voices-v1.0.bin")
@@ -53,7 +134,6 @@ def _load_kokoro():
 
 
 async def get_kokoro():
-    """Lazy-load Kokoro TTS model (thread-safe)."""
     global _kokoro
     if _kokoro is not None:
         return _kokoro
@@ -66,13 +146,11 @@ async def get_kokoro():
 
 
 def _generate_audio(kokoro, text, voice, speed):
-    """Generate audio synchronously (called in thread)."""
     samples, sr = kokoro.create(text, voice=voice, speed=speed)
     return samples, sr
 
 
 def samples_to_wav(samples, sample_rate: int) -> bytes:
-    """Convert float32 numpy samples to WAV bytes."""
     import numpy as np
     samples = np.clip(samples, -1.0, 1.0)
     pcm = (samples * 32767).astype(np.int16)
@@ -90,16 +168,12 @@ def samples_to_wav(samples, sample_rate: int) -> bytes:
 
 
 def fix_pronunciation(text: str) -> str:
-    """Fix common pronunciation issues."""
-    # Fix Jefe -> Heffe (Spanish pronunciation)
     text = re.sub(r'\bJefe\b', 'Heffe', text)
     text = re.sub(r'\bjefe\b', 'heffe', text)
     return text
 
 
 def split_sentences(text: str) -> list[str]:
-    """Split text into speakable sentences."""
-    # Strip markdown formatting
     text = re.sub(r'```[\s\S]*?```', ' ', text)
     text = re.sub(r'`[^`]+`', '', text)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
@@ -108,18 +182,11 @@ def split_sentences(text: str) -> list[str]:
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
     text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-    # Split on sentence boundaries
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    sentences = []
-    for p in parts:
-        p = p.strip()
-        if p:
-            sentences.append(p)
-    return sentences
+    return [p.strip() for p in parts if p.strip()]
 
 
 def extract_text_from_content(content):
-    """Extract plain text from various content formats."""
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -129,19 +196,17 @@ def extract_text_from_content(content):
                 if c.get("type") == "text":
                     texts.append(c.get("text", ""))
                 elif c.get("type") == "thinking":
-                    pass  # Skip thinking blocks
+                    pass
             elif isinstance(c, str):
                 texts.append(c)
         text = " ".join(texts)
     else:
         text = str(content)
-    # Strip OpenClaw directives like [[reply_to_current]]
     text = re.sub(r'\[\[[^\]]*\]\]\s*', '', text).strip()
     return text
 
 
 def is_valid_response(text: str) -> bool:
-    """Check if text is a valid response (not NO_REPLY, HEARTBEAT_OK, empty, etc.)"""
     if not text or not text.strip():
         return False
     text = text.strip()
@@ -155,7 +220,6 @@ def is_valid_response(text: str) -> bool:
 # --- FastAPI app ---
 @asynccontextmanager
 async def lifespan(app):
-    """Pre-load Kokoro model on server start."""
     asyncio.create_task(_warmup_kokoro())
     yield
 
@@ -183,18 +247,13 @@ async def health():
 
 @app.post("/tts")
 async def tts(request: Request):
-    """Generate speech from text using Kokoro TTS. Returns WAV audio."""
     body = await request.json()
     text = body.get("text", "").strip()
     if not text:
         return Response(status_code=400)
-
-    # Fix pronunciation
     text = fix_pronunciation(text)
-
     voice = body.get("voice", KOKORO_VOICE)
     speed = body.get("speed", KOKORO_SPEED)
-
     try:
         kokoro = await get_kokoro()
         samples, sr = await asyncio.to_thread(_generate_audio, kokoro, text, voice, speed)
@@ -206,9 +265,40 @@ async def tts(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/send")
+async def send_message(request: Request):
+    """Send a message to OpenClaw via CLI."""
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        return Response(status_code=400)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "openclaw", "agent", "--agent", "main", "--message", text, "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Don't wait — let SSE pick up the response from the session file
+        # But we do want to know if the command at least started
+        # Give it 2 seconds to fail fast if there's an error
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            if proc.returncode and proc.returncode != 0:
+                err = (await proc.stderr.read()).decode()
+                print(f"[voice-mode] openclaw error: {err[:200]}")
+                return JSONResponse({"error": err[:200]}, status_code=502)
+        except asyncio.TimeoutError:
+            pass  # Still running = good, means it's processing
+        return JSONResponse({"status": "sent"})
+    except FileNotFoundError:
+        return JSONResponse({"error": "openclaw CLI not found"}, status_code=500)
+    except Exception as e:
+        print(f"[voice-mode] send error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/tts/voices")
 async def tts_voices():
-    """List available Kokoro voices."""
     try:
         kokoro = await get_kokoro()
         voices = kokoro.get_voices()
@@ -219,10 +309,7 @@ async def tts_voices():
 
 @app.get("/events")
 async def events(request: Request):
-    """Server-sent events endpoint that watches session file for assistant responses."""
-    
     async def generate():
-        # Wait for any session file to exist
         session_file = None
         for _ in range(60):
             session_file = get_latest_session()
@@ -236,9 +323,19 @@ async def events(request: Request):
 
         print(f"[voice-mode] SSE watching: {session_file.name}")
 
+        # Scan existing file for metadata (model, cost) and send as first event
+        meta = scan_session_metadata(session_file)
+        current_model = meta["modelId"]
+        current_provider = meta["provider"]
+        session_cost = meta["totalCost"]
+        session_input = meta["totalInput"]
+        session_output = meta["totalOutput"]
+
+        yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+
         # Open file and seek to end
         f = open(session_file, "r")
-        f.seek(0, 2)  # Seek to end
+        f.seek(0, 2)
         last_size = f.tell()
         last_processed_id = None
         pending_working = False
@@ -249,9 +346,8 @@ async def events(request: Request):
                 if await request.is_disconnected():
                     break
 
-                # Every 2 seconds, check if a newer session file appeared
                 check_counter += 1
-                if check_counter >= 40:  # 40 * 0.05s = 2s
+                if check_counter >= 40:
                     check_counter = 0
                     latest = get_latest_session()
                     if latest and latest != session_file:
@@ -259,39 +355,58 @@ async def events(request: Request):
                         f.close()
                         session_file = latest
                         f = open(session_file, "r")
+                        # Scan new session metadata
+                        meta = scan_session_metadata(session_file)
+                        current_model = meta["modelId"]
+                        current_provider = meta["provider"]
+                        session_cost = meta["totalCost"]
+                        session_input = meta["totalInput"]
+                        session_output = meta["totalOutput"]
+                        yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
                         f.seek(0, 2)
                         last_size = f.tell()
                         last_processed_id = None
                         pending_working = False
                         continue
 
-                # Check if file grew
                 f.seek(0, 2)
                 current_size = f.tell()
 
                 if current_size > last_size:
-                    # New data available, read it
                     f.seek(last_size)
                     new_data = f.read()
                     last_size = current_size
 
-                    # Process each line
                     for line in new_data.strip().split("\n"):
                         if not line.strip():
                             continue
-
                         try:
                             entry = json.loads(line)
                         except json.JSONDecodeError:
                             continue
 
-                        if entry.get("type") != "message":
+                        etype = entry.get("type")
+
+                        # Track model changes in real time
+                        if etype == "model_change":
+                            current_model = entry.get("modelId", current_model)
+                            current_provider = entry.get("provider", current_provider)
+                            yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+                            continue
+
+                        if etype == "custom" and entry.get("customType") == "model-snapshot":
+                            data = entry.get("data", {})
+                            current_model = data.get("modelId", current_model)
+                            current_provider = data.get("provider", current_provider)
+                            yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+                            continue
+
+                        if etype != "message":
                             continue
 
                         msg = entry.get("message", {})
                         role = msg.get("role")
 
-                        # User message = OpenClaw is about to think
                         if role == "user":
                             if not pending_working:
                                 pending_working = True
@@ -302,18 +417,29 @@ async def events(request: Request):
                             continue
 
                         msg_id = entry.get("id", "")
-
-                        # Skip if already processed
                         if msg_id == last_processed_id:
                             continue
                         last_processed_id = msg_id
 
-                        # Extract text content
+                        # Extract usage data
+                        usage = msg.get("usage")
+                        msg_model = msg.get("model", current_model)
+                        msg_cost = 0
+                        msg_input = 0
+                        msg_output = 0
+                        if usage:
+                            msg_cost = usage.get("cost", {}).get("total", 0)
+                            msg_input = usage.get("input", 0)
+                            msg_output = usage.get("output", 0)
+                            session_cost += msg_cost
+                            session_input += msg_input
+                            session_output += msg_output
+
                         content = msg.get("content", "")
                         text = extract_text_from_content(content)
 
                         if is_valid_response(text):
-                            yield f"data: {json.dumps({'type': 'done', 'text': text})}\n\n"
+                            yield f"data: {json.dumps({'type': 'done', 'text': text, 'model': format_model_name(msg_model), 'tokens': msg_input + msg_output, 'cost': round(msg_cost, 6), 'sessionCost': round(session_cost, 6)})}\n\n"
                             pending_working = False
                         else:
                             yield f"data: {json.dumps({'type': 'idle'})}\n\n"
@@ -329,10 +455,8 @@ async def events(request: Request):
 
 
 async def _warmup_kokoro():
-    """Load model in background so first TTS request is fast."""
     try:
         kokoro = await get_kokoro()
-        # Generate a tiny warmup to JIT-compile ONNX session
         await asyncio.to_thread(_generate_audio, kokoro, "Ready.", KOKORO_VOICE, KOKORO_SPEED)
         print("[voice-mode] Kokoro TTS warmed up")
     except Exception as e:
