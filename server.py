@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,17 +27,20 @@ SESSIONS_DIR = Path("~/.openclaw/agents/main/sessions").expanduser()
 
 
 OPENCLAW_CONFIG = Path("~/.openclaw/openclaw.json").expanduser()
+_config_cache: dict = {"mtime": 0, "model": None, "provider": None}
 
 
 def get_config_model() -> tuple[str | None, str | None]:
-    """Read the default model from OpenClaw's config file."""
+    """Read the default model from OpenClaw's config file (cached by mtime)."""
     try:
+        mtime = OPENCLAW_CONFIG.stat().st_mtime
+        if mtime == _config_cache["mtime"]:
+            return _config_cache["model"], _config_cache["provider"]
         config = json.loads(OPENCLAW_CONFIG.read_text())
         primary = config.get("agents", {}).get("defaults", {}).get("model", {}).get("primary")
-        if primary and "/" in primary:
-            provider = primary.split("/")[0]
-            return primary, provider
-        return primary, None
+        provider = primary.split("/")[0] if primary and "/" in primary else None
+        _config_cache.update(mtime=mtime, model=primary, provider=provider)
+        return primary, provider
     except Exception:
         return None, None
 
@@ -104,6 +108,10 @@ def scan_session_metadata(session_file: Path) -> dict:
     }
 
 
+def _meta_event(model, provider, cost, input_tokens, output_tokens) -> str:
+    return f"data: {json.dumps({'type': 'meta', 'model': format_model_name(model), 'provider': provider or '', 'cost': cost, 'inputTokens': input_tokens, 'outputTokens': output_tokens})}\n\n"
+
+
 def format_model_name(model_id: str | None) -> str:
     """Format model ID for display: 'anthropic/claude-opus-4-6' -> 'claude opus 4.6'"""
     if not model_id:
@@ -151,7 +159,6 @@ def _generate_audio(kokoro, text, voice, speed):
 
 
 def samples_to_wav(samples, sample_rate: int) -> bytes:
-    import numpy as np
     samples = np.clip(samples, -1.0, 1.0)
     pcm = (samples * 32767).astype(np.int16)
     data_size = len(pcm) * 2
@@ -171,19 +178,6 @@ def fix_pronunciation(text: str) -> str:
     text = re.sub(r'\bJefe\b', 'Heffe', text)
     text = re.sub(r'\bjefe\b', 'heffe', text)
     return text
-
-
-def split_sentences(text: str) -> list[str]:
-    text = re.sub(r'```[\s\S]*?```', ' ', text)
-    text = re.sub(r'`[^`]+`', '', text)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
-    text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    text = re.sub(r'^\s*[-*•]\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-    parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [p.strip() for p in parts if p.strip()]
 
 
 def extract_text_from_content(content):
@@ -331,7 +325,7 @@ async def events(request: Request):
         session_input = meta["totalInput"]
         session_output = meta["totalOutput"]
 
-        yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+        yield _meta_event(current_model, current_provider, session_cost, session_input, session_output)
 
         # Open file and seek to end
         f = open(session_file, "r")
@@ -362,7 +356,7 @@ async def events(request: Request):
                         session_cost = meta["totalCost"]
                         session_input = meta["totalInput"]
                         session_output = meta["totalOutput"]
-                        yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+                        yield _meta_event(current_model, current_provider, session_cost, session_input, session_output)
                         f.seek(0, 2)
                         last_size = f.tell()
                         last_processed_id = None
@@ -391,14 +385,14 @@ async def events(request: Request):
                         if etype == "model_change":
                             current_model = entry.get("modelId", current_model)
                             current_provider = entry.get("provider", current_provider)
-                            yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+                            yield _meta_event(current_model, current_provider, session_cost, session_input, session_output)
                             continue
 
                         if etype == "custom" and entry.get("customType") == "model-snapshot":
                             data = entry.get("data", {})
                             current_model = data.get("modelId", current_model)
                             current_provider = data.get("provider", current_provider)
-                            yield f"data: {json.dumps({'type': 'meta', 'model': format_model_name(current_model), 'provider': current_provider or '', 'cost': session_cost, 'inputTokens': session_input, 'outputTokens': session_output})}\n\n"
+                            yield _meta_event(current_model, current_provider, session_cost, session_input, session_output)
                             continue
 
                         if etype != "message":

@@ -354,9 +354,12 @@ const costTicker = $('costTicker');
 let seenMessages = new Set();
 let sessionCost = 0;
 
-// --- Clean OpenClaw directives ---
+// --- Helpers ---
 function cleanText(text) {
   return text.replace(/\[\[[^\]]*\]\]\s*/g, '').trim();
+}
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // --- Audio context ---
@@ -438,6 +441,7 @@ function splitSentences(text) {
 
 // --- TTS ---
 let speakAbort = null;
+let activeSource = null; // Track current audio source for interruption
 
 async function fetchTTSAudio(text) {
   const resp = await fetch('/tts', {
@@ -463,10 +467,13 @@ function playAudioBuffer(buffer) {
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(ctx.destination);
-      source.onended = resolve;
-      source.onerror = resolve;
+      activeSource = source;
+      let timer;
+      const done = () => { clearTimeout(timer); activeSource = null; resolve(); };
+      source.onended = done;
+      source.onerror = done;
       source.start(0);
-      setTimeout(resolve, (audioBuffer.duration + 2) * 1000);
+      timer = setTimeout(done, (audioBuffer.duration + 2) * 1000);
     } catch (e) {
       resolve();
     }
@@ -552,7 +559,7 @@ function addMessage(text, meta) {
     metaHtml = `<div class="msg-meta">${parts.join(' · ')}</div>`;
   }
 
-  div.innerHTML = `<div class="speaker">Jefe</div><div>${text.replace(/\n/g,'<br>')}</div>${metaHtml}`;
+  div.innerHTML = `<div class="speaker">Jefe</div><div>${escapeHtml(text).replace(/\n/g,'<br>')}</div>${metaHtml}`;
   conversation.appendChild(div);
   scrollToBottom();
 }
@@ -581,7 +588,7 @@ function startRecording() {
   // Interrupt any current speech
   if (currentState === 'speaking') {
     speakAbort = null;
-    if (audioCtx) { audioCtx.close(); audioCtx = null; audioInitialized = false; }
+    if (activeSource) { try { activeSource.stop(); } catch(e) {} activeSource = null; }
   }
 
   initAudio();
@@ -633,9 +640,8 @@ function stopRecording() {
   if (recognition) {
     try { recognition.stop(); } catch(e) {}
   }
-  // If we have a final transcript, send immediately
-  // (onend handler will also fire, but we handle it here for responsiveness)
   const text = (finalTranscript + '').trim() || transcript.textContent.trim();
+  finalTranscript = ''; // Clear to prevent onend from double-sending
   transcript.classList.remove('visible');
   if (text) {
     sendVoiceMessage(text);
@@ -672,7 +678,7 @@ function addUserMessage(text) {
   if (emptyState && emptyState.parentNode) emptyState.remove();
   const div = document.createElement('div');
   div.className = 'message user';
-  div.innerHTML = `<div class="speaker">You</div><div>${text.replace(/\n/g,'<br>')}</div>`;
+  div.innerHTML = `<div class="speaker">You</div><div>${escapeHtml(text).replace(/\n/g,'<br>')}</div>`;
   conversation.appendChild(div);
   scrollToBottom();
 }
@@ -709,7 +715,7 @@ function connect() {
     if (msg.type === 'working') {
       if (currentState === 'speaking') {
         speakAbort = null;
-        if (audioCtx) { audioCtx.close(); audioCtx = null; audioInitialized = false; }
+        if (activeSource) { try { activeSource.stop(); } catch(e) {} activeSource = null; }
       }
       setState('working');
     } else if (msg.type === 'done' && msg.text) {
@@ -737,16 +743,7 @@ function connect() {
 connect();
 
 // Auto-unlock audio
-(async () => {
-  try {
-    const ctx = getAudioCtx();
-    if (ctx.state === 'suspended') await ctx.resume();
-    if (ctx.state === 'running') {
-      audioInitialized = true;
-      audioGate.classList.add('hidden');
-    }
-  } catch(e) {}
-})();
+(async () => { try { await initAudio(); } catch(e) {} })();
 
 // Scroll to bottom on load
 scrollToBottom();
